@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 
@@ -71,9 +72,7 @@ def evaluate(model, test_loader):
     return correct / total, total_loss / len(test_loader)
 
 
-# ─────────────────────────────────────────────────────────────
 # MÉTRIQUES D'EFFICACITÉ ÉNERGÉTIQUE
-# ─────────────────────────────────────────────────────────────
 
 def communication_cost_per_round(model, n_nodes):
     """
@@ -126,3 +125,44 @@ def rounds_to_convergence(accuracy_history, threshold=0.85):
         if acc >= threshold:
             return i + 1
     return None
+
+
+# TOPOLOGIES VARIABLES — PARTICIPATION PARTIELLE
+
+def select_participants(n_nodes, k, rng=None):
+    """
+    Sélectionne k nœuds parmi n_nodes pour un round donné.
+
+    Simule les topologies variables du Verrou 1 :
+    dans un réseau 6G réel, tous les nœuds ne sont pas
+    disponibles simultanément (pannes, surcharge, mobilité).
+
+    Inspiré du paradigme d'autoscaling dynamique de :
+    "Autoscaling Packet Core Network Functions with Deep RL"
+    (Singh, Verma, Matsuo, Fossati, Fraysse — NOMS 2023)
+
+    Args:
+        n_nodes : nombre total de nœuds
+        k       : nombre de participants par round
+        rng     : RandomState pour reproductibilité
+
+    Returns:
+        list[int] : indices des nœuds sélectionnés
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+    return rng.choice(n_nodes, k, replace=False).tolist()
+
+
+# ANALYSE μ — SENSIBILITÉ DU TERME PROXIMAL FEDPROX
+
+def mu_sensitivity_label(mu):
+    """Retourne une description du rôle de μ pour un affichage clair."""
+    if mu == 0:
+        return "FedAvg (μ=0)"
+    elif mu < 0.05:
+        return f"FedProx faible (μ={mu}) — contrainte légère"
+    elif mu <= 0.2:
+        return f"FedProx standard (μ={mu}) — contrainte modérée"
+    else:
+        return f"FedProx fort (μ={mu}) — contrainte forte"

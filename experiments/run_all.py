@@ -1,13 +1,9 @@
-import copy
-import json
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import copy, json, sys, os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import (
     N_NODES, N_ROUNDS, LOCAL_EPOCHS, BATCH_SIZE,
@@ -20,95 +16,149 @@ from src.data import (
 )
 from src.federation import (
     local_train, federated_average, evaluate,
-    communication_cost_per_round, rounds_to_convergence
+    communication_cost_per_round, rounds_to_convergence,
+    select_participants, mu_sensitivity_label
 )
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 CONVERGENCE_THRESHOLD = 0.85
-
-EXPERIMENTS = [
-    {"key": "FedAvg_IID",      "label": "FedAvg + IID",
-     "split": split_iid,      "mu": 0.0},
-    {"key": "FedAvg_nonIID",   "label": "FedAvg + non-IID  [Verrou 1]",
-     "split": split_non_iid,  "mu": 0.0},
-    {"key": "FedProx_nonIID",  "label": f"FedProx (μ={MU_FEDPROX}) + non-IID  [Solution Verrou 1]",
-     "split": split_non_iid,  "mu": MU_FEDPROX},
-    {"key": "FedProx_IID",     "label": f"FedProx (μ={MU_FEDPROX}) + IID",
-     "split": split_iid,      "mu": MU_FEDPROX},
-]
+K_PARTICIPANTS = 3   # nœuds actifs par round (partial participation)
+MU_VALUES = [0.0, 0.01, 0.05, 0.1, 0.3, 0.5]
 
 
-def run_experiment(X_train, y_train, X_test, y_test, exp):
-    print(f"\n{'='*62}")
-    print(f"  {exp['label']}")
-    print(f"{'='*62}")
+# RUNNER PRINCIPAL
+
+def run_experiment(X_train, y_train, X_test, y_test,
+                   split_fn, mu=0.0, label="",
+                   partial=False, k=None):
+    print(f"\n{'='*65}")
+    print(f"  {label}")
+    print(f"{'='*65}")
 
     test_loader = DataLoader(
         make_dataset(X_test, y_test), batch_size=256, shuffle=False)
-    node_datasets = exp["split"](X_train, y_train, N_NODES)
+    node_datasets = split_fn(X_train, y_train, N_NODES)
     node_loaders  = [DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
                      for ds in node_datasets]
 
     sizes = [len(ds) for ds in node_datasets]
-    fed_weights = [s / sum(sizes) for s in sizes]
-
     global_model = LightMLP()
+    comm = communication_cost_per_round(global_model, k if partial else N_NODES)
 
-    #  Communication cost (fixe, calculé une fois) 
-    comm = communication_cost_per_round(global_model, N_NODES)
-    print(f"  Paramètres modèle    : {comm['params']:,}")
-    print(f"  Coût/round réseau    : {comm['KB']} KB  "
-          f"({comm['MB']} MB)")
-    print(f"  Coût total ({N_ROUNDS} rounds): "
-          f"{round(comm['KB'] * N_ROUNDS, 1)} KB  "
-          f"({round(comm['MB'] * N_ROUNDS, 4)} MB)")
-    print(f"  Données par nœud     : {sizes}")
+    print(f"  Paramètres modèle     : {comm['params']:,}")
+    print(f"  Participation/round   : {k if partial else N_NODES}/{N_NODES} nœuds"
+          f"{'  ← topologie variable' if partial else ''}")
+    print(f"  Coût comm./round      : {comm['KB']} KB")
+    print(f"  Données par nœud      : {sizes}")
 
     history = {"accuracy": [], "loss": []}
+    rng = np.random.RandomState(SEED)
 
     for rnd in range(1, N_ROUNDS + 1):
+        # Sélection des nœuds participants
+        if partial and k:
+            participants = select_participants(N_NODES, k, rng)
+        else:
+            participants = list(range(N_NODES))
+
+        active_loaders = [node_loaders[i] for i in participants]
+        active_sizes   = [sizes[i] for i in participants]
+        total_active   = sum(active_sizes)
+        fed_weights    = [s / total_active for s in active_sizes]
+
         local_models = [
             local_train(
                 copy.deepcopy(global_model), loader,
                 epochs=LOCAL_EPOCHS, lr=LR,
-                mu=exp["mu"], global_model=global_model
+                mu=mu, global_model=global_model
             )
-            for loader in node_loaders
+            for loader in active_loaders
         ]
+
         global_model = federated_average(
             global_model, local_models, fed_weights)
         acc, loss = evaluate(global_model, test_loader)
         history["accuracy"].append(acc)
         history["loss"].append(loss)
-        print(f"  Round {rnd:2d}/{N_ROUNDS} | "
-              f"Acc: {acc*100:.2f}% | Loss: {loss:.4f}")
 
-    #  Rounds to convergence ─
-    rtc = rounds_to_convergence(
-        history["accuracy"], CONVERGENCE_THRESHOLD)
-    history["rounds_to_convergence"] = rtc
-    history["comm_cost_KB_per_round"] = comm["KB"]
-    history["total_comm_cost_KB"] = round(
-        comm["KB"] * (rtc if rtc else N_ROUNDS), 1)
+        part_str = f"[nœuds {participants}]" if partial else ""
+        print(f"  Round {rnd:2d}/{N_ROUNDS} | "
+              f"Acc: {acc*100:.2f}% | Loss: {loss:.4f} {part_str}")
+
+    rtc  = rounds_to_convergence(history["accuracy"], CONVERGENCE_THRESHOLD)
+    active_n = k if partial else N_NODES
+    cost = communication_cost_per_round(global_model, active_n)
+
+    history["rounds_to_convergence"]  = rtc
+    history["comm_cost_KB_per_round"] = cost["KB"]
+    history["total_comm_cost_KB"]     = round(
+        cost["KB"] * (rtc if rtc else N_ROUNDS), 1)
+    history["n_participants"]         = active_n
 
     if rtc:
-        print(f"\n  ✅ Seuil {int(CONVERGENCE_THRESHOLD*100)}% atteint "
-              f"au round {rtc}/{N_ROUNDS}")
-        print(f"     Coût comm. jusqu'à convergence : "
-              f"{history['total_comm_cost_KB']} KB")
+        print(f"\n  ✅ Seuil {int(CONVERGENCE_THRESHOLD*100)}% → round {rtc} "
+              f"| Coût total : {history['total_comm_cost_KB']} KB")
     else:
-        print(f"\n  ⚠️  Seuil {int(CONVERGENCE_THRESHOLD*100)}% "
-              f"non atteint en {N_ROUNDS} rounds")
+        print(f"\n  ⚠️  Seuil {int(CONVERGENCE_THRESHOLD*100)}% non atteint")
 
     return history
 
 
+# ANALYSE SENSIBILITÉ μ
+
+def run_mu_sensitivity(X_train, y_train, X_test, y_test):
+    print(f"\n{'='*65}")
+    print(f"  Analyse de sensibilité μ — FedProx sur non-IID")
+    print(f"  Valeurs testées : {MU_VALUES}")
+    print(f"{'='*65}")
+
+    test_loader = DataLoader(
+        make_dataset(X_test, y_test), batch_size=256, shuffle=False)
+    node_datasets = split_non_iid(X_train, y_train, N_NODES)
+    node_loaders  = [DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+                     for ds in node_datasets]
+    sizes = [len(ds) for ds in node_datasets]
+    fed_weights = [s / sum(sizes) for s in sizes]
+
+    mu_results = {}
+    for mu in MU_VALUES:
+        label = mu_sensitivity_label(mu)
+        print(f"\n  → {label}")
+        global_model = LightMLP()
+        history = {"accuracy": [], "loss": []}
+
+        for rnd in range(1, N_ROUNDS + 1):
+            local_models = [
+                local_train(copy.deepcopy(global_model), loader,
+                            epochs=LOCAL_EPOCHS, lr=LR,
+                            mu=mu, global_model=global_model)
+                for loader in node_loaders
+            ]
+            global_model = federated_average(
+                global_model, local_models, fed_weights)
+            acc, loss = evaluate(global_model, test_loader)
+            history["accuracy"].append(acc)
+            history["loss"].append(loss)
+
+        rtc = rounds_to_convergence(history["accuracy"], CONVERGENCE_THRESHOLD)
+        history["rounds_to_convergence"] = rtc
+        history["final_accuracy"] = history["accuracy"][-1]
+        mu_results[str(mu)] = history
+
+        print(f"     Acc finale : {history['final_accuracy']*100:.2f}% "
+              f"| Rounds→85% : {rtc if rtc else 'N/A'}")
+
+    return mu_results
+
+
+# MAIN
+
 def main():
-    print("=" * 62)
-    print("  FedEdge6G — Simulation DFL | Topologie Réseau 6G")
-    print("=" * 62)
+    print("=" * 65)
+    print("  FedEdge6G — Simulation DFL | Réseau 6G 4 Nœuds")
+    print("=" * 65)
     print(f"\n  Classes de trafic : {CLASS_NAMES}")
     print("\n  Profils nœuds (non-IID) :")
     for k, v in NODE_PROFILES.items():
@@ -120,55 +170,70 @@ def main():
     print(f"   Train: {len(y_train)} | Test: {len(y_test)}")
 
     results = {}
-    for exp in EXPERIMENTS:
-        results[exp["key"]] = run_experiment(
-            X_train, y_train, X_test, y_test, exp)
+
+    # Expérience 1 — FedAvg + IID
+    results["FedAvg_IID"] = run_experiment(
+        X_train, y_train, X_test, y_test,
+        split_fn=split_iid, mu=0.0,
+        label="Exp 1 — FedAvg + IID (baseline optimiste)")
+
+    # Expérience 2 — FedAvg + non-IID
+    results["FedAvg_nonIID"] = run_experiment(
+        X_train, y_train, X_test, y_test,
+        split_fn=split_non_iid, mu=0.0,
+        label="Exp 2 — FedAvg + non-IID [Verrou 1a : données hétérogènes]")
+
+    # Expérience 3 — FedProx + non-IID
+    results["FedProx_nonIID"] = run_experiment(
+        X_train, y_train, X_test, y_test,
+        split_fn=split_non_iid, mu=MU_FEDPROX,
+        label=f"Exp 3 — FedProx (μ={MU_FEDPROX}) + non-IID [Solution Verrou 1a]")
+
+    # Expérience 4 — FedProx + non-IID + Partial Participation
+    results["FedProx_nonIID_partial"] = run_experiment(
+        X_train, y_train, X_test, y_test,
+        split_fn=split_non_iid, mu=MU_FEDPROX,
+        label=f"Exp 4 — FedProx + non-IID + Participation partielle ({K_PARTICIPANTS}/{N_NODES}) [Verrou 1b : topologies variables]",
+        partial=True, k=K_PARTICIPANTS)
+
+    # Expérience 5 — Sensibilité μ
+    results["mu_sensitivity"] = run_mu_sensitivity(
+        X_train, y_train, X_test, y_test)
 
     os.makedirs("results", exist_ok=True)
     with open("results/results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    #  Tableau de synthèse ─
-    print("\n" + "=" * 70)
+    #  Tableau synthèse 
+    print("\n" + "=" * 72)
     print("  SYNTHÈSE FINALE")
-    print("=" * 70)
-    print(f"  {'Expérience':<32} {'Acc.':<10} "
-          f"{'Rounds→85%':<14} {'Coût comm.'}")
-    print("-" * 70)
+    print("=" * 72)
+    print(f"  {'Expérience':<38} {'Acc.':<10} {'→85%':<10} {'Coût'}")
+    print("-" * 72)
 
-    labels = {
-        "FedAvg_IID":     "FedAvg + IID",
-        "FedAvg_nonIID":  "FedAvg + non-IID   [Verrou 1]",
-        "FedProx_nonIID": "FedProx + non-IID  [Solution]",
-        "FedProx_IID":    "FedProx + IID",
+    exp_labels = {
+        "FedAvg_IID":            "FedAvg + IID",
+        "FedAvg_nonIID":         "FedAvg + non-IID        [Verrou 1a]",
+        "FedProx_nonIID":        "FedProx + non-IID       [Solution]",
+        "FedProx_nonIID_partial":f"FedProx + non-IID + {K_PARTICIPANTS}/{N_NODES} nœuds [Verrou 1b]",
     }
-    for key, hist in results.items():
-        acc = hist["accuracy"][-1] * 100
-        rtc = hist["rounds_to_convergence"]
-        cost = hist["total_comm_cost_KB"]
-        rtc_str  = f"round {rtc}" if rtc else "non atteint"
-        cost_str = f"{cost} KB"
-        print(f"  {labels[key]:<32} {acc:<10.2f}% "
-              f"{rtc_str:<14} {cost_str}")
+    for key, lbl in exp_labels.items():
+        h = results[key]
+        acc  = h["accuracy"][-1] * 100
+        rtc  = h.get("rounds_to_convergence")
+        cost = h.get("total_comm_cost_KB", "N/A")
+        print(f"  {lbl:<38} {acc:<10.2f}% "
+              f"{'R'+str(rtc) if rtc else 'N/A':<10} {cost} KB")
 
-    print("=" * 70)
+    print("\n  Sensibilité μ (non-IID) :")
+    for mu_val, h in results["mu_sensitivity"].items():
+        acc = h["final_accuracy"] * 100
+        rtc = h.get("rounds_to_convergence")
+        print(f"    μ={float(mu_val):<5} → Acc: {acc:.2f}% "
+              f"| →85% : {'R'+str(rtc) if rtc else 'N/A'}")
 
-    #  Insight énergétique ─
-    fa  = results["FedAvg_nonIID"]
-    fp  = results["FedProx_nonIID"]
-    acc_gap  = (fp["accuracy"][-1] - fa["accuracy"][-1]) * 100
-    rtc_fa   = fa["rounds_to_convergence"] or N_ROUNDS
-    rtc_fp   = fp["rounds_to_convergence"] or N_ROUNDS
-    rounds_saved = rtc_fa - rtc_fp
-    energy_saved = rounds_saved * fa["comm_cost_KB_per_round"]
-
-    print(f"\n  🔋 Efficacité énergétique (non-IID) :")
-    print(f"     FedProx converge {rounds_saved} rounds plus tôt que FedAvg")
-    print(f"     → {energy_saved:.1f} KB de communication économisés")
-    print(f"     → +{acc_gap:.1f}% accuracy finale")
-    print(f"\n     Verrou 1 validé : FedProx atténue le client drift")
-    print(f"     Verrou 3 validé : moins de rounds = moins d'énergie")
-    print("\n  📁 Résultats → results/results.json")
+    print(f"\n  📁 Résultats → results/results.json")
+    print(f"  🔬 Lance visualize.py pour le Pareto front et les graphiques")
 
 
 if __name__ == "__main__":

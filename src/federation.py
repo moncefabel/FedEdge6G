@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
 
 
 def local_train(model, dataloader, epochs, lr, mu=0.0, global_model=None):
@@ -15,9 +14,6 @@ def local_train(model, dataloader, epochs, lr, mu=0.0, global_model=None):
         lr           : learning rate
         mu           : coefficient proximal (0 = FedAvg, >0 = FedProx)
         global_model : référence au modèle global (pour terme proximal)
-
-    Returns:
-        model entraîné localement
     """
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -29,7 +25,6 @@ def local_train(model, dataloader, epochs, lr, mu=0.0, global_model=None):
             output = model(X_batch)
             loss = criterion(output, y_batch)
 
-            # Terme proximal FedProx
             if mu > 0 and global_model is not None:
                 proximal_term = sum(
                     torch.norm(w - w_g.detach()) ** 2
@@ -47,9 +42,6 @@ def local_train(model, dataloader, epochs, lr, mu=0.0, global_model=None):
 def federated_average(global_model, local_models, weights=None):
     """
     Agrégation FedAvg : moyenne pondérée des poids locaux.
-
-    weights : proportions de données de chaque nœud
-              (nœud avec plus de données → poids plus élevé)
     """
     if weights is None:
         weights = [1.0 / len(local_models)] * len(local_models)
@@ -77,3 +69,60 @@ def evaluate(model, test_loader):
             correct += (pred == y_batch).sum().item()
             total += y_batch.size(0)
     return correct / total, total_loss / len(test_loader)
+
+
+# ─────────────────────────────────────────────────────────────
+# MÉTRIQUES D'EFFICACITÉ ÉNERGÉTIQUE
+# ─────────────────────────────────────────────────────────────
+
+def communication_cost_per_round(model, n_nodes):
+    """
+    Calcule le coût de communication d'un round de fédération.
+
+    À chaque round, chaque nœud :
+      - upload   son modèle local vers le serveur  (+)
+      - download le modèle global agrégé           (+)
+    Soit 2 × taille_modèle × n_nodes bytes échangés.
+
+    Inspiré du travail de Fraysse et al. sur l'allocation
+    efficace de ressources dans les réseaux 5G (IFIP 2020).
+
+    Returns:
+        dict avec bytes total, KB, et MB
+    """
+    # float32 = 4 bytes par paramètre
+    params = sum(p.numel() for p in model.parameters())
+    bytes_per_node = params * 4          # upload du nœud
+    total_bytes = bytes_per_node * n_nodes * 2  # upload + download
+
+    return {
+        "params":      params,
+        "bytes":       total_bytes,
+        "KB":          round(total_bytes / 1024, 2),
+        "MB":          round(total_bytes / (1024 ** 2), 4),
+    }
+
+
+def rounds_to_convergence(accuracy_history, threshold=0.85):
+    """
+    Retourne le premier round où l'accuracy dépasse le seuil.
+
+    Proxy de la consommation énergétique totale :
+    moins de rounds = moins d'échanges réseau = moins d'énergie.
+    Cohérent avec l'objectif neutralité carbone 2040 d'Orange
+    (Verrou 3 : arbitrage QoS / empreinte carbone).
+
+    Inspiré de la métrique de convergence sous contraintes de
+    "Safe RL for Core Network autoscaling" (Long & Fraysse, 2024).
+
+    Args:
+        accuracy_history : liste d'accuracy par round [0.0, 1.0]
+        threshold        : seuil cible (défaut 0.85 = 85%)
+
+    Returns:
+        int  : numéro du round (1-indexed), ou None si non atteint
+    """
+    for i, acc in enumerate(accuracy_history):
+        if acc >= threshold:
+            return i + 1
+    return None

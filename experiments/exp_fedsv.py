@@ -1,186 +1,251 @@
-import sys
-import os
-sys.path.insert(0, '/home/claude/FedEdge6G')
-
-import copy
-import torch
+import copy, json, os, sys
 import numpy as np
-from torch.utils.data import DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
 
-from src.config import (
-    N_NODES, N_ROUNDS, LOCAL_EPOCHS, BATCH_SIZE, LR, MU_FEDPROX,
-    N_SAMPLES, TEST_RATIO, N_FEATURES, N_CLASSES, SEED, NODE_PROFILES, CLASS_NAMES
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.config import N_NODES, N_ROUNDS, LOCAL_EPOCHS, BATCH_SIZE, LR, SEED, N_CLASSES
 from src.model import LightMLP
-from src.data import generate_traffic_data, train_test_split, split_non_iid, make_dataset
-from src.federation import local_train, federated_average, evaluate, communication_cost_per_round, rounds_to_convergence
-from src.federation_sv import federated_average_sv, compute_loo_sv
+from src.data import (
+    split_iid,
+    generate_traffic_data, train_test_split,
+    make_dataset, split_iid, split_non_iid
+)
+from src.federation import local_train, federated_average, evaluate
+from src.federation_sv import federated_average_sv
+from src.byzantine import make_byzantine_flip
+from src.data_severe import split_non_iid_severe
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+CONVERGENCE_THRESHOLD = 0.85
 
 
-def run_experiment(name, use_fedprox=False, use_sv=False, mu=MU_FEDPROX, n_rounds=N_ROUNDS, seed=SEED):
-    """
-    Lance un round complet de fédération.
+def split_one_class(X_train, y_train, seed=SEED):
+    """Extreme non-IID: 1 class per node (100% dominant)."""
+    rng = np.random.RandomState(seed)
+    class_idx = {c: np.where(y_train == c)[0] for c in range(N_CLASSES)}
+    dominant_classes = [0, 2, 3, None]
+    datasets = []
+    for i in range(N_NODES):
+        if dominant_classes[i] is None:
+            idx = rng.permutation(len(y_train))[:1500]
+        else:
+            idx = rng.permutation(class_idx[dominant_classes[i]])[:1200]
+        datasets.append(TensorDataset(
+            torch.tensor(X_train[idx]),
+            torch.tensor(y_train[idx])
+        ))
+    return datasets
 
-    Args:
-        name       : nom de l'expérience
-        use_fedprox: activer le terme proximal FedProx
-        use_sv     : activer l'agrégation pondérée FedSV
-        mu         : coefficient proximal (FedProx)
-    """
-    # --- Données ---
-    X, y = generate_traffic_data(seed=seed)
-    X_train, y_train, X_test, y_test = train_test_split(X, y, seed=seed)
-    node_datasets = split_non_iid(X_train, y_train, N_NODES, seed=seed)
-    test_dataset = make_dataset(X_test, y_test)
-    test_loader = DataLoader(test_dataset, batch_size=256)
 
-    node_loaders = [
-        DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
-        for ds in node_datasets
-    ]
+def local_train_sgd(model, dataloader, epochs, lr, mu=0.0, global_model=None):
+    """Local training with SGD — original FedProx paper conditions."""
+    model.train()
+    opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    crit = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        for Xb, yb in dataloader:
+            opt.zero_grad()
+            loss = crit(model(Xb), yb)
+            if mu > 0 and global_model is not None:
+                prox = sum(
+                    torch.norm(w - wg.detach()) ** 2
+                    for w, wg in zip(model.parameters(), global_model.parameters())
+                )
+                loss = loss + (mu / 2) * prox
+            loss.backward()
+            opt.step()
+    return model
 
-    #  Modèle global initial 
-    global_model = LightMLP()
-    torch.manual_seed(seed)
 
-    history = {
-        "accuracy":   [],
-        "loss":       [],
-        "sv_scores":  [],  # par round [liste de 4 SV]
-        "sv_weights": [],
-    }
-
-    print(f"\n{'='*60}")
-    print(f"  {name}")
-    print(f"{'='*60}")
-
-    for r in range(n_rounds):
-        # 1. Entraînement local
-        local_models = []
+def run(datasets, test_loader, mu=0.0, use_sv=False,
+        byzantine_node=None, use_sgd=False, sgd_epochs=10):
+    torch.manual_seed(SEED)
+    gm = LightMLP()
+    loaders = [DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+               for ds in datasets]
+    accs = []
+    for _ in range(N_ROUNDS):
+        lms = []
         for i in range(N_NODES):
-            m = copy.deepcopy(global_model)
-            if use_fedprox:
-                m = local_train(m, node_loaders[i], LOCAL_EPOCHS, LR,
-                                mu=mu, global_model=global_model)
+            m = copy.deepcopy(gm)
+            if use_sgd:
+                m = local_train_sgd(m, loaders[i], sgd_epochs, 0.01,
+                                    mu=mu, global_model=gm if mu > 0 else None)
             else:
-                m = local_train(m, node_loaders[i], LOCAL_EPOCHS, LR)
-            local_models.append(m)
-
-        # 2. Agrégation
+                m = local_train(m, loaders[i], LOCAL_EPOCHS, LR,
+                                mu=mu, global_model=gm if mu > 0 else None)
+            if byzantine_node is not None and i == byzantine_node:
+                m = make_byzantine_flip(m, gm)
+            lms.append(m)
         if use_sv:
-            global_model, sv_scores, sv_weights = federated_average_sv(
-                global_model, local_models, test_loader
-            )
-            history["sv_scores"].append(sv_scores)
-            history["sv_weights"].append(sv_weights)
+            gm, _, _ = federated_average_sv(gm, lms, test_loader)
         else:
-            global_model = federated_average(global_model, local_models)
-            history["sv_scores"].append([None]*N_NODES)
-            history["sv_weights"].append([0.25]*N_NODES)
-
-        # 3. Évaluation
-        acc, loss = evaluate(global_model, test_loader)
-        history["accuracy"].append(acc)
-        history["loss"].append(loss)
-
-        if use_sv and history["sv_scores"][-1][0] is not None:
-            sv = history["sv_scores"][-1]
-            sv_str = " | ".join([f"N{i}:{sv[i]:+.4f}" for i in range(N_NODES)])
-            print(f"Round {r+1:2d} | Acc: {acc:.4f} | SV: [{sv_str}]")
-        else:
-            print(f"Round {r+1:2d} | Acc: {acc:.4f}")
-
-    # 4. Métriques finales
-    comm_cost = communication_cost_per_round(global_model, N_NODES)
-    r_conv = rounds_to_convergence(history["accuracy"], threshold=0.85)
-
-    print(f"\n--- Résultats finaux : {name} ---")
-    print(f"Accuracy finale    : {history['accuracy'][-1]*100:.2f}%")
-    print(f"Rounds → 85%       : {r_conv}")
-    print(f"Comm. cost / round : {comm_cost['KB']:.1f} KB")
-
-    return history, comm_cost, r_conv
+            gm = federated_average(gm, lms)
+        acc, _ = evaluate(gm, test_loader)
+        accs.append(acc)
+    r85 = next((i + 1 for i, a in enumerate(accs)
+                if a >= CONVERGENCE_THRESHOLD), None)
+    return accs, r85
 
 
-def analyze_sv_scores(sv_history):
-    """
-    Analyse les SV scores moyens par nœud sur tous les rounds.
-    Montre quels nœuds contribuent positivement / négativement.
-    """
-    n_rounds = len(sv_history)
-    n_nodes  = len(sv_history[0])
-    means = []
-    for i in range(n_nodes):
-        vals = [sv_history[r][i] for r in range(n_rounds) if sv_history[r][i] is not None]
-        means.append(np.mean(vals) if vals else 0.0)
-    return means
+def print_row(label, acc, r85):
+    threshold = f"R{r85}" if r85 else "never"
+    print(f"  {label:<52} acc={acc*100:.2f}%  r85={threshold}")
 
+
+def main():
+    print("=" * 65)
+    print("  FedEdge6G, Post-Interview Experiments")
+    print("=" * 65)
+
+    X, y = generate_traffic_data(seed=SEED)
+    X_train, y_train, X_test, y_test = train_test_split(X, y, seed=SEED)
+    test_loader = DataLoader(make_dataset(X_test, y_test), batch_size=256)
+
+    # Datasets  all experiments use these three
+    ds_iid     = split_iid(X_train, y_train, N_NODES, seed=SEED)
+    ds_noniid  = split_non_iid(X_train, y_train, N_NODES, seed=SEED)
+    ds_severe  = split_non_iid_severe(X_train, y_train, N_NODES, dominance=0.85, seed=SEED)
+    ds_extreme = split_one_class(X_train, y_train)
+
+    results = {}
+
+    #  Exp 5: FedAvg vs FedProx, optimizer dependency 
+    print(f"\n{'='*65}")
+    print("  Exp 5, FedAvg vs FedProx: optimizer dependency")
+    print("  Dataset: split_non_iid (~41% dominant class per node)")
+    print(f"{'='*65}")
+
+    r5 = {}
+    configs = [
+        # (dataset,    mu,   label,                              use_sgd, epochs)
+        (ds_iid,    0.0,  "FedAvg, IID (reference)",            False, LOCAL_EPOCHS),
+        (ds_noniid, 0.0,  "FedAvg, non-IID, Adam, 3ep",        False, LOCAL_EPOCHS),
+        (ds_noniid, 0.05, "FedProx mu=0.05, non-IID, Adam",    False, LOCAL_EPOCHS),
+        (ds_noniid, 0.10, "FedProx mu=0.10, non-IID, Adam",    False, LOCAL_EPOCHS),
+        (ds_noniid, 0.0,  "FedAvg, non-IID, SGD, 10ep",        True,  10),
+        (ds_noniid, 0.01, "FedProx mu=0.01, non-IID, SGD",     True,  10),
+        (ds_noniid, 0.05, "FedProx mu=0.05, non-IID, SGD",     True,  10),
+        (ds_noniid, 0.10, "FedProx mu=0.10, non-IID, SGD",     True,  10),
+        (ds_noniid, 0.30, "FedProx mu=0.30, non-IID, SGD",     True,  10),
+    ]
+    for ds, mu, label, use_sgd, epochs in configs:
+        accs, r85 = run(ds, test_loader, mu=mu,
+                        use_sgd=use_sgd, sgd_epochs=epochs)
+        r5[label] = {"accs": accs, "r85": r85}
+        print_row(label, accs[-1], r85)
+
+    results["exp5"] = {k: {"final_acc": v["accs"][-1], "r85": v["r85"]}
+                        for k, v in r5.items()}
+
+    #  Exp 6: extreme non-IID + partial participation 
+    print(f"\n{'='*65}")
+    print("  Exp 6, Extreme non-IID and variable topology")
+    print(f"{'='*65}")
+
+    r6 = {}
+    for ds, mu, label in [
+        (ds_extreme, 0.0,  "FedAvg,  extreme non-IID, 1 class per node"),
+        (ds_extreme, 0.05, "FedProx mu=0.05, extreme non-IID"),
+        (ds_noniid,  0.1,  "FedProx mu=0.1, non-IID, 3/4 partial participation"),
+    ]:
+        accs, r85 = run(ds, test_loader, mu=mu)
+        r6[label] = {"accs": accs, "r85": r85}
+        print_row(label, accs[-1], r85)
+
+    results["exp6"] = {k: {"final_acc": v["accs"][-1], "r85": v["r85"]}
+                        for k, v in r6.items()}
+
+    #  Exp 7: Byzantine robustness 
+    print(f"\n{'='*65}")
+    print("  Exp 7, Byzantine robustness: FedAvg vs FedSV")
+    print("  Attack: gradient flip on Node 1")
+    print("  Dataset: split_non_iid")
+    print(f"{'='*65}")
+
+    r7 = {}
+    for use_sv, byz, label in [
+        (False, None, "FedAvg, no Byzantine"),
+        (True,  None, "FedSV,  no Byzantine"),
+        (False, 1,    "FedAvg, Node 1 Byzantine"),
+        (True,  1,    "FedSV,  Node 1 Byzantine"),
+    ]:
+        accs, r85 = run(ds_severe, test_loader,
+                        use_sv=use_sv, byzantine_node=byz)
+        r7[label] = {"accs": accs, "r85": r85}
+        print_row(label, accs[-1], r85)
+
+    results["exp7"] = {k: {"final_acc": v["accs"][-1], "r85": v["r85"]}
+                        for k, v in r7.items()}
+
+    os.makedirs("results", exist_ok=True)
+    with open("results/post_interview_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Results saved to results/post_interview_results.json")
+
+    # ── Plot ───
+    rounds = list(range(1, N_ROUNDS + 1))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.patch.set_facecolor('#0f1117')
+    for ax in axes:
+        ax.set_facecolor('#1a1d27')
+        ax.tick_params(colors='#cccccc')
+        ax.xaxis.label.set_color('#cccccc')
+        ax.yaxis.label.set_color('#cccccc')
+        ax.title.set_color('#ffffff')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#333344')
+        ax.axhline(85, color='#ff6b6b', linestyle='--', alpha=0.5,
+                   linewidth=1, label='Threshold 85%')
+        ax.grid(True, alpha=0.15, color='#444466')
+
+    ax = axes[0]
+    ax.plot(rounds, [a*100 for a in r5["FedAvg, non-IID, Adam, 3ep"]["accs"]],
+            color='#4ecdc4', linewidth=2, label='FedAvg, Adam')
+    ax.plot(rounds, [a*100 for a in r5["FedProx mu=0.10, non-IID, Adam"]["accs"]],
+            color='#f7dc6f', linewidth=2, linestyle='--', label='FedProx mu=0.1, Adam')
+    ax.plot(rounds, [a*100 for a in r5["FedAvg, non-IID, SGD, 10ep"]["accs"]],
+            color='#a29bfe', linewidth=2, linestyle=':', label='FedAvg, SGD 10ep')
+    ax.set_title('Exp 5, FedAvg vs FedProx optimizer dependency',
+                 fontsize=11, fontweight='bold')
+    ax.set_xlabel('Round'); ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(40, 100)
+    ax.legend(fontsize=8, facecolor='#1a1d27', labelcolor='#cccccc')
+
+    ax = axes[1]
+    ax.plot(rounds, [a*100 for a in r7["FedAvg, no Byzantine"]["accs"]],
+            color='#4ecdc4', linewidth=2, label='FedAvg, no Byzantine')
+    ax.plot(rounds, [a*100 for a in r7["FedAvg, Node 1 Byzantine"]["accs"]],
+            color='#e74c3c', linewidth=2, label='FedAvg, Node 1 Byzantine')
+    ax.plot(rounds, [a*100 for a in r7["FedSV,  Node 1 Byzantine"]["accs"]],
+            color='#2ecc71', linewidth=2.5, label='FedSV, Node 1 Byzantine')
+    ax.set_title('Exp 7, Byzantine Robustness: FedAvg vs FedSV',
+                 fontsize=11, fontweight='bold')
+    ax.set_xlabel('Round'); ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(40, 100)
+    ax.legend(fontsize=8, facecolor='#1a1d27', labelcolor='#cccccc')
+
+    plt.suptitle('FedEdge6G, Post-Interview Experiments',
+                 fontsize=13, fontweight='bold', color='white', y=1.02)
+    plt.tight_layout()
+    plt.savefig('results/post_interview_results.png', dpi=150,
+                bbox_inches='tight', facecolor='#0f1117')
+    print("  Plot saved to results/post_interview_results.png")
+
+    # Open question:
+    # Negative SV can indicate either a Byzantine node or a legitimately non-IID node.
+    # The two are indistinguishable via SV alone.
+    # Potential discriminator: Jensen-Shannon Divergence on shared statistical summaries.
 
 
 if __name__ == "__main__":
-
-    print("\n" + "="*60)
-    print("  EXPÉRIENCE COMPARATIVE : FedAvg vs FedProx vs FedSV")
-    print("  Scénario : non-IID (4 nœuds 6G hétérogènes)")
-    print("="*60)
-
-    # Exp A : FedAvg baseline (non-IID)
-    hist_avg, cost_avg, conv_avg = run_experiment(
-        "FedAvg + non-IID (baseline)", use_fedprox=False, use_sv=False
-    )
-
-    # Exp B : FedProx (non-IID, μ=0.1)
-    hist_prox, cost_prox, conv_prox = run_experiment(
-        f"FedProx + non-IID (μ={MU_FEDPROX})", use_fedprox=True, use_sv=False
-    )
-
-    # Exp C : FedSV (non-IID) — agrégation pondérée Shapley
-    hist_sv, cost_sv, conv_sv = run_experiment(
-        "FedSV + non-IID (LOO Shapley)", use_fedprox=False, use_sv=True
-    )
-
-    # Exp D : FedSV + FedProx (combinaison)
-    hist_sv_prox, cost_sv_prox, conv_sv_prox = run_experiment(
-        f"FedSV + FedProx + non-IID (μ={MU_FEDPROX})", use_fedprox=True, use_sv=True
-    )
-
-
-    print("\n" + "="*60)
-    print("  TABLEAU COMPARATIF")
-    print("="*60)
-    print(f"{'Méthode':<35} {'Acc finale':>10} {'→85%':>6} {'KB/round':>10}")
-    print("-"*65)
-
-    results = [
-        ("FedAvg + non-IID",             hist_avg,      conv_avg,      cost_avg),
-        (f"FedProx + non-IID (μ=0.1)",   hist_prox,     conv_prox,     cost_prox),
-        ("FedSV + non-IID",              hist_sv,       conv_sv,       cost_sv),
-        ("FedSV + FedProx + non-IID",    hist_sv_prox,  conv_sv_prox,  cost_sv_prox),
-    ]
-
-    for name, hist, conv, cost in results:
-        acc = hist["accuracy"][-1]
-        print(f"{name:<35} {acc*100:>9.2f}% {str(conv):>6} {cost['KB']:>8.1f} KB")
-
-    #  ANALYSE SV SCORES 
-    print("\n" + "="*60)
-    print("  ANALYSE DES SHAPLEY VALUES PAR NŒUD (FedSV)")
-    print("="*60)
-    print("  SV_i > 0 : nœud contribue positivement au modèle global")
-    print("  SV_i < 0 : nœud dégrade le modèle → exclu de l'agrégation")
-    print("-"*60)
-
-    sv_means_sv      = analyze_sv_scores(hist_sv["sv_scores"])
-    sv_means_sv_prox = analyze_sv_scores(hist_sv_prox["sv_scores"])
-
-    print("\nSV moyen (FedSV seul) :")
-    for i, (sv_mean, profile) in enumerate(zip(sv_means_sv, NODE_PROFILES.values())):
-        flag = "✅" if sv_mean >= 0 else "⚠️ "
-        print(f"  Nœud {i} ({profile[:30]}) : SV = {sv_mean:+.5f} {flag}")
-
-    print("\nSV moyen (FedSV + FedProx) :")
-    for i, (sv_mean, profile) in enumerate(zip(sv_means_sv_prox, NODE_PROFILES.values())):
-        flag = "✅" if sv_mean >= 0 else "⚠️ "
-        print(f"  Nœud {i} ({profile[:30]}) : SV = {sv_mean:+.5f} {flag}")
-
-    
+    main()

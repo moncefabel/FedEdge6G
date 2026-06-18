@@ -86,7 +86,7 @@ Features: throughput, latency, packet size, jitter, packet loss, priority, bandw
 |-----------|---------------|---------------|-------------------|
 | Exp 1 — FedAvg + IID *(baseline)* | 96.67% | Round 2 | 194 KB |
 | Exp 2 — FedAvg + non-IID *(realistic 6G)* | 95.72% | Round 3 | 292 KB |
-| Exp 3 — FedProx + non-IID *(Verrou 1a solution)* | **96.33%** ✅ | Round 3 | 292 KB |
+| Exp 3 — FedProx + non-IID *(Verrou 1a solution)* | **96.33%** | Round 3 | 292 KB |
 | Exp 4 — FedProx + non-IID + 3/4 nodes *(Verrou 1b)* | 91.94% | Round 5 | 364 KB |
 
 ### μ Sensitivity Analysis (FedProx, non-IID)
@@ -137,21 +137,71 @@ cost_per_round = model_params × 4 bytes × n_active_nodes × 2
 
 ---
 
+## Post-Interview Experiments (June 18, 2026)
+
+Three additional experiments added after the PhD interview, investigating open questions raised during the discussion.
+
+### Exp 5 — FedAvg vs FedProx: optimizer dependency
+
+The original results showed FedProx (96.33%) only marginally ahead of FedAvg (95.72%), which seemed inconsistent with the literature. Re-running with controlled seeds and varying dominance levels (50–80%) revealed why: FedEdge6G uses Adam by default, a practical choice for small models. Adam's per-parameter adaptive learning rates naturally compensate for non-IID gradient bias, making the proximal term redundant. FedProx was designed for SGD, where drift accumulates more predictably over many local epochs. Tested under SGD too — FedAvg remained competitive.
+
+| Scenario | Method | Final Acc | Rounds to 85% |
+|---|---|---|---|
+| non-IID moderate | FedAvg, Adam | 94.89% | R3 |
+| non-IID moderate | FedProx μ=0.1, Adam | 94.72% | R9 |
+| non-IID moderate | FedAvg, SGD 10ep | 97.11% | R5 |
+| non-IID moderate | FedProx μ=0.01, SGD | 97.11% | R6 |
+| non-IID moderate | FedProx μ=0.30, SGD | 82.06% | never |
+
+### Exp 6 — Extreme non-IID and variable topology
+
+| Scenario | Method | Final Acc | Rounds to 85% |
+|---|---|---|---|
+| Extreme non-IID, 1 class/node | FedAvg, Adam | 50.61% | never |
+| Extreme non-IID | FedProx μ=0.05, Adam | 55.78% | never |
+| non-IID + 3/4 partial participation | FedProx μ=0.1 | 91.94% | R5 |
+
+Under extreme non-IID, no aggregation algorithm converges. The problem is structural: it requires controlling which nodes collaborate, not fixing the aggregation strategy. This directly motivates placement-aware FL (Verrou 1).
+
+### Exp 7 — Byzantine robustness: FedAvg vs FedSV
+
+Attack: gradient flip on Node 1 (`w_byz = 2 × w_global − w_local`). Direction of update exactly inverted. Weights remain plausible, undetectable by direct inspection.
+
+**FedSV** (Otmani, El-Azouzi, Labatut — ICC 2024): leave-one-out Shapley Value aggregation. Nodes with negative marginal contribution are excluded.
+
+| Scenario | Method | Final Acc | 85% threshold |
+|---|---|---|---|
+| No Byzantine | FedAvg | 94.89% | R3 |
+| No Byzantine | FedSV | 94.17% | R7 |
+| Node 1 Byzantine | FedAvg | 83.83% | never |
+| Node 1 Byzantine | FedSV | 95.56% | R8 |
+
+FedSV detects Node 1 via its negative Shapley Value and excludes it automatically. FedAvg is poisoned and never reaches the operational threshold.
+
+![Post-interview results](results/post_interview_results.png)
+
+---
+
 ## Project Structure
 
 ```
 FedEdge6G/
 ├── src/
-│   ├── config.py        # Centralized hyperparameters and node profiles
-│   ├── model.py         # LightMLP — frugal edge model (~3K params)
-│   ├── data.py          # 6G traffic generation + IID/non-IID splits
-│   └── federation.py    # FedAvg, FedProx, partial participation, energy metrics
+│   ├── config.py           # Centralized hyperparameters and node profiles
+│   ├── model.py            # LightMLP — frugal edge model (~3K params)
+│   ├── data.py             # 6G traffic generation + IID/non-IID splits
+│   ├── data_severe.py      # Severe non-IID splits (85% dominance)
+│   ├── federation.py       # FedAvg, FedProx, partial participation, energy metrics
+│   ├── federation_sv.py    # FedSV, LOO Shapley Value aggregation
+│   └── byzantine.py        # Byzantine attack simulation (gradient flip)
 ├── experiments/
-│   ├── run_all.py       # 4 experiments + μ sensitivity analysis
-│   └── visualize.py     # 6-panel dashboard (convergence, Pareto, μ sensitivity)
+│   ├── run_all.py          # Original 4 experiments + μ sensitivity analysis
+│   ├── visualize.py        # 6-panel dashboard (convergence, Pareto, μ sensitivity)
+│   └── exp_fedsv.py        # Post-interview: FedSV + Byzantine + severity
 ├── results/
-│   ├── results.json     # Per-round metrics for all experiments
-│   └── dfl_results.png  # 6-panel result dashboard
+│   ├── results.json        # Per-round metrics for all experiments
+│   ├── dfl_results.png     # Original 6-panel result dashboard
+│   └── post_interview_results.png
 └── requirements.txt
 ```
 
@@ -164,6 +214,7 @@ uv venv .venv && source .venv/bin/activate
 uv pip install -r requirements.txt
 python -m experiments.run_all
 python -m experiments.visualize
+python -m experiments.exp_fedsv
 ```
 
 ---
@@ -172,6 +223,8 @@ python -m experiments.visualize
 
 - McMahan et al. (2017). *Communication-Efficient Learning of Deep Networks from Decentralized Data.* AISTATS. — **[FedAvg]**
 - Li et al. (2020). *Federated Optimization in Heterogeneous Networks.* MLSys. — **[FedProx]**
+- Otmani, El-Azouzi, Labatut (2024). *FedSV: Byzantine-Robust Federated Learning via Shapley Value.* IEEE ICC. — **[FedSV]**
+- Dabaja, El-Azouzi (2025). *FedPLT: Scalable, Resource-Efficient, and Heterogeneity-Aware FL via Partial Layer Training.* arXiv:2605.02337. — **[FedPLT]**
 - Fraysse et al. (2020). *A resource usage efficient distributed allocation algorithm for 5G SFCs.* IFIP DAIS. — **[Communication cost metric]**
 - Long & Fraysse (2024). *Safe RL for Core Network autoscaling.* CNSM. — **[Convergence metric]**
 - Akem, Fraysse & Fiore (2024). *Encrypted traffic classification at line rate in programmable switches with ML.* NOMS. — **[Traffic classification context]**
@@ -180,4 +233,4 @@ python -m experiments.visualize
 
 ---
 
-**Author:** Moncef Bouhabel · moncef.bmd@gmail.com  
+**Author:** Moncef Bouhabel · moncef.bmd@gmail.com

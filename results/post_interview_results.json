@@ -1,0 +1,72 @@
+{
+  "exp5": {
+    "FedAvg, IID (reference)": {
+      "final_acc": 0.9666666666666667,
+      "r85": 2
+    },
+    "FedAvg, non-IID, Adam, 3ep": {
+      "final_acc": 0.9488888888888889,
+      "r85": 3
+    },
+    "FedProx mu=0.05, non-IID, Adam": {
+      "final_acc": 0.9444444444444444,
+      "r85": 3
+    },
+    "FedProx mu=0.10, non-IID, Adam": {
+      "final_acc": 0.9444444444444444,
+      "r85": 3
+    },
+    "FedAvg, non-IID, SGD, 10ep": {
+      "final_acc": 0.9666666666666667,
+      "r85": 2
+    },
+    "FedProx mu=0.01, non-IID, SGD": {
+      "final_acc": 0.9666666666666667,
+      "r85": 1
+    },
+    "FedProx mu=0.05, non-IID, SGD": {
+      "final_acc": 0.9694444444444444,
+      "r85": 3
+    },
+    "FedProx mu=0.10, non-IID, SGD": {
+      "final_acc": 0.9683333333333334,
+      "r85": 2
+    },
+    "FedProx mu=0.30, non-IID, SGD": {
+      "final_acc": 0.9377777777777778,
+      "r85": 3
+    }
+  },
+  "exp6": {
+    "FedAvg,  extreme non-IID, 1 class per node": {
+      "final_acc": 0.5061111111111111,
+      "r85": null
+    },
+    "FedProx mu=0.05, extreme non-IID": {
+      "final_acc": 0.5577777777777778,
+      "r85": null
+    },
+    "FedProx mu=0.1, non-IID, 3/4 partial participation": {
+      "final_acc": 0.9444444444444444,
+      "r85": 3
+    }
+  },
+  "exp7": {
+    "FedAvg, no Byzantine": {
+      "final_acc": 0.9488888888888889,
+      "r85": 3
+    },
+    "FedSV,  no Byzantine": {
+      "final_acc": 0.9416666666666667,
+      "r85": 7
+    },
+    "FedAvg, Node 1 Byzantine": {
+      "final_acc": 0.8383333333333334,
+      "r85": null
+    },
+    "FedSV,  Node 1 Byzantine": {
+      "final_acc": 0.9555555555555556,
+      "r85": 8
+    }
+  }
+}

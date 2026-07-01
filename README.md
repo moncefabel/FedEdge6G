@@ -6,7 +6,6 @@
 
 Simulation of Distributed Federated Learning (DFL) on a 4-node 6G network topology, comparing **FedAvg** and **FedProx** under **IID** and **non-IID** traffic distributions — with partial node participation, Pareto front analysis and μ sensitivity study.
 
-Preparatory research for the CIFRE PhD thesis *"Orchestration dynamique d'IA distribuée pour des réseaux 6G économes en énergie"* — Orange Innovation (ref. 2026-51929), Project TREES.
 
 ---
 

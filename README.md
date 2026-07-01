@@ -177,7 +177,6 @@ Attack: gradient flip on Node 1 (`w_byz = 2 × w_global − w_local`). Direction
 
 FedSV detects Node 1 via its negative Shapley Value and excludes it automatically. FedAvg is poisoned and never reaches the operational threshold.
 
-![Post-interview results](results/post_interview_results.png)
 
 ---
 

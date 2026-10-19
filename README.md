@@ -136,9 +136,8 @@ cost_per_round = model_params × 4 bytes × n_active_nodes × 2
 
 ---
 
-## Post-Interview Experiments (June 18, 2026)
 
-Three additional experiments added after the PhD interview, investigating open questions raised during the discussion.
+
 
 ### Exp 5 — FedAvg vs FedProx: optimizer dependency
 
